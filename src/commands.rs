@@ -57,11 +57,7 @@ async fn ensure_hydrated(cluster: &doctl::ClusterInfo) -> anyhow::Result<()> {
 
     eprintln!(
         "{}",
-        format!(
-            "Fetching kubeconfig for {}...",
-            cluster.kube_context_name()
-        )
-        .yellow()
+        format!("Fetching kubeconfig for {}...", cluster.kube_context_name()).yellow()
     );
 
     let content = doctl::download_kubeconfig(&cluster.doctl_context, &cluster.id).await?;
@@ -73,19 +69,19 @@ async fn ensure_hydrated(cluster: &doctl::ClusterInfo) -> anyhow::Result<()> {
 /// Launch fzf fed by cached metadata instantly, with a background doctl sync that
 /// streams newly discovered context names into fzf live. When the user makes a
 /// selection (or cancels), the background sync is aborted immediately.
-/// Returns (selected context name, best-available cluster list) or None if cancelled.
+///
+/// Returns `(selected context name, best-available cluster list)` or `None` if cancelled.
 async fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doctl::ClusterInfo>)>>
 {
     let cached_clusters = cache::load_metadata()?.unwrap_or_default();
     let cached_names: HashSet<String> = cached_clusters
         .iter()
-        .map(|c| c.kube_context_name())
+        .map(doctl::ClusterInfo::kube_context_name)
         .collect();
 
-    // Channel for streaming context names into fzf
     let (tx, rx) = mpsc::unbounded_channel::<String>();
 
-    // Send cached names immediately
+    // Send cached names immediately so fzf has content before the sync starts.
     for name in &cached_names {
         let _ = tx.send(name.clone());
     }
@@ -98,15 +94,13 @@ async fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doc
     // saves metadata incrementally.
     let discovered_bg = Arc::clone(&discovered);
     let sync_handle = tokio::spawn(async move {
-        let contexts = match doctl::list_auth_contexts().await {
-            Ok(c) => c,
-            Err(_) => return,
+        let Ok(contexts) = doctl::list_auth_contexts().await else {
+            return;
         };
 
         for ctx in &contexts {
-            let clusters = match doctl::list_clusters(&ctx.name).await {
-                Ok(c) => c,
-                Err(_) => continue,
+            let Ok(clusters) = doctl::list_clusters(&ctx.name).await else {
+                continue;
             };
 
             let mut new_names = Vec::new();
@@ -121,7 +115,6 @@ async fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doc
                         }
                     }
                 }
-                // Save metadata incrementally after each doctl context
                 let _ = cache::save_metadata(&acc);
             }
 
@@ -133,7 +126,6 @@ async fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doc
         }
     });
 
-    // Launch fzf
     let mut fzf = std::process::Command::new("fzf")
         .args(["--height=~40%", "--reverse", "--prompt=context> "])
         .stdin(Stdio::piped())
@@ -155,12 +147,11 @@ async fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doc
         }
     });
 
-    // Wait for user to pick or cancel
     let output = tokio::task::spawn_blocking(move || fzf.wait_with_output())
         .await?
         .context("Failed to wait for fzf")?;
 
-    // Kill the background sync immediately -- don't waste time on remaining doctl calls.
+    // Kill the background sync immediately so we don't waste time or network.
     sync_handle.abort();
     let _ = writer_handle.await;
 
@@ -173,16 +164,12 @@ async fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doc
         return Ok(None);
     }
 
-    // Use the best metadata we have: whatever the background sync accumulated.
-    let clusters = {
-        let acc = discovered.lock().unwrap();
-        acc.clone()
-    };
+    let clusters = discovered.lock().unwrap().clone();
 
     Ok(Some((selection, clusters)))
 }
 
-/// Main entry point: show cached contexts instantly via fzf with live background refresh,
+/// Show cached contexts instantly via fzf with live background refresh,
 /// hydrate only the selected context, launch kubie.
 pub async fn ctx(context: Option<String>) -> anyhow::Result<()> {
     let (ctx_name, clusters) = match context {
@@ -200,7 +187,7 @@ pub async fn ctx(context: Option<String>) -> anyhow::Result<()> {
         },
     };
 
-    let (_path, cluster) = cache::find_config_for_context(&ctx_name, &clusters)
+    let (_, cluster) = cache::find_config_for_context(&ctx_name, &clusters)
         .context(format!("Unknown context: {ctx_name}"))?;
 
     ensure_hydrated(&cluster).await?;
