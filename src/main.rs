@@ -9,5 +9,5 @@ use cli::Cli;
 fn main() -> anyhow::Result<()> {
     cache::init();
     let cli = Cli::parse();
-    commands::ctx(cli.context)
+    commands::ctx(cli.context, cli.no_sync)
 }

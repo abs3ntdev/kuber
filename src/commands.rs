@@ -36,6 +36,7 @@ fn fetch_all_clusters(contexts: &[doctl::AuthContext]) -> Vec<doctl::ClusterInfo
 }
 
 /// Discover all clusters across all doctl auth contexts and save metadata.
+/// Replaces the cached list entirely -- stale clusters are removed.
 fn full_sync() -> anyhow::Result<Vec<doctl::ClusterInfo>> {
     eprintln!(
         "{}",
@@ -85,10 +86,14 @@ fn ensure_hydrated(cluster: &doctl::ClusterInfo) -> anyhow::Result<()> {
 }
 
 /// Interactive context picker using skim. Cached names appear instantly.
-/// Background thread syncs from doctl and pushes new names into skim live.
+/// When `no_sync` is false, a background thread syncs from doctl and pushes
+/// new names into skim live. Stale clusters are removed from metadata.
 #[allow(clippy::too_many_lines)]
-fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doctl::ClusterInfo>)>> {
+fn pick_context_with_live_sync(
+    no_sync: bool,
+) -> anyhow::Result<Option<(String, Vec<doctl::ClusterInfo>)>> {
     // If no metadata exists, do a full sync first so the user sees all clusters.
+    // This happens regardless of --no-sync since there's nothing to show otherwise.
     let cached_clusters = match cache::load_metadata()? {
         Some(clusters) if !clusters.is_empty() => clusters,
         _ => full_sync()?,
@@ -113,44 +118,59 @@ fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doctl::Cl
     let clusters_shared: Arc<Mutex<Vec<doctl::ClusterInfo>>> =
         Arc::new(Mutex::new(cached_clusters.clone()));
 
-    // Background thread: discover new clusters in parallel, send them into skim,
-    // save metadata only if something changed.
-    let clusters_bg = Arc::clone(&clusters_shared);
-    let tx_bg = tx.clone();
-    std::thread::spawn(move || {
-        let Ok(contexts) = doctl::list_auth_contexts() else {
-            return;
-        };
+    if !no_sync {
+        // Background thread: discover all clusters in parallel, replace the cached
+        // list with the fresh one (removing stale entries), send new names to skim.
+        let clusters_bg = Arc::clone(&clusters_shared);
+        let tx_bg = tx.clone();
+        std::thread::spawn(move || {
+            let Ok(contexts) = doctl::list_auth_contexts() else {
+                return;
+            };
 
-        // Fetch all contexts in parallel.
-        let fresh_clusters = fetch_all_clusters(&contexts);
-        let mut changed = false;
-        let mut new_items: Vec<Arc<dyn SkimItem>> = Vec::new();
-
-        {
-            let mut all = clusters_bg.lock().unwrap();
-            for cluster in fresh_clusters {
-                let name = cluster.kube_context_name();
-                if !cached_names.contains(&name)
-                    && !all.iter().any(|c| c.kube_context_name() == name)
-                {
-                    new_items.push(Arc::new(name));
-                    all.push(cluster);
-                    changed = true;
-                }
+            let fresh_clusters = fetch_all_clusters(&contexts);
+            if fresh_clusters.is_empty() {
+                return;
             }
 
-            if changed {
+            let fresh_names: HashSet<String> = fresh_clusters
+                .iter()
+                .map(doctl::ClusterInfo::kube_context_name)
+                .collect();
+
+            // Find names that are new (not in the cached set).
+            let new_names: Vec<String> = fresh_names
+                .iter()
+                .filter(|name| !cached_names.contains(*name))
+                .cloned()
+                .collect();
+
+            // Replace the shared cluster list with the fresh one.
+            // This removes stale clusters that no longer exist in DO.
+            {
+                let mut all = clusters_bg.lock().unwrap();
+                *all = fresh_clusters;
+            }
+
+            // Always save -- even if no new clusters, stale ones may have been removed,
+            // or existing cluster metadata (version, node pools) may have changed.
+            if let Ok(all) = clusters_bg.lock() {
                 let _ = cache::save_metadata(&all);
             }
-        }
 
-        if !new_items.is_empty() {
-            let _ = tx_bg.send(new_items);
-        }
-    });
+            // Send new names to skim so they appear in the picker.
+            if !new_names.is_empty() {
+                let new_items: Vec<Arc<dyn SkimItem>> = new_names
+                    .into_iter()
+                    .map(|name| Arc::new(name) as Arc<dyn SkimItem>)
+                    .collect();
+                let _ = tx_bg.send(new_items);
+            }
+        });
+    }
 
-    // Drop our sender so skim knows we're done once the background thread finishes.
+    // Drop our sender so skim knows we're done once the background thread finishes
+    // (or immediately if --no-sync).
     drop(tx);
 
     // Preview callback: look up cluster info by context name and format it.
@@ -218,14 +238,14 @@ fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doctl::Cl
 
     let selection = selected.output().to_string();
 
-    // Use the shared cluster list which includes any newly discovered clusters.
+    // Use the shared cluster list which includes any updates from the background sync.
     let clusters = clusters_shared.lock().unwrap().clone();
 
     Ok(Some((selection, clusters)))
 }
 
-/// Main entry point. Fully synchronous -- no async runtime needed.
-pub fn ctx(context: Option<String>) -> anyhow::Result<()> {
+/// Main entry point.
+pub fn ctx(context: Option<String>, no_sync: bool) -> anyhow::Result<()> {
     let (ctx_name, clusters) = match context {
         Some(name) => {
             let mut clusters = cache::load_metadata()?.unwrap_or_default();
@@ -234,7 +254,7 @@ pub fn ctx(context: Option<String>) -> anyhow::Result<()> {
             }
             (name, clusters)
         }
-        None => match pick_context_with_live_sync()? {
+        None => match pick_context_with_live_sync(no_sync)? {
             Some(result) => result,
             None => return Ok(()),
         },

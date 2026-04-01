@@ -3,7 +3,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use serde::{Deserialize, Serialize};
+
 use crate::doctl::ClusterInfo;
+
+/// Current metadata schema version. Bump this when the `ClusterInfo` struct changes.
+const METADATA_VERSION: u32 = 1;
+
+/// Versioned metadata envelope. Allows detecting and discarding stale schemas.
+#[derive(Serialize, Deserialize)]
+struct Metadata {
+    version: u32,
+    clusters: Vec<ClusterInfo>,
+}
 
 /// Persistent storage for metadata (survives reboots).
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -74,25 +86,39 @@ fn ensure_data_dir() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Save metadata (cluster list) to persistent storage.
+/// Save metadata (cluster list) to persistent storage with a version tag.
 pub fn save_metadata(clusters: &[ClusterInfo]) -> anyhow::Result<()> {
     ensure_data_dir()?;
     let path = metadata_path();
-    let json = serde_json::to_string_pretty(clusters)?;
+    let metadata = Metadata {
+        version: METADATA_VERSION,
+        clusters: clusters.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&metadata)?;
     fs::write(&path, json)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
-/// Load cached metadata. Returns `None` if no cache exists.
+/// Load cached metadata. Returns `None` if no cache exists or if the
+/// schema version doesn't match (stale metadata is discarded automatically).
 pub fn load_metadata() -> anyhow::Result<Option<Vec<ClusterInfo>>> {
     let path = metadata_path();
     if !path.exists() {
         return Ok(None);
     }
     let data = fs::read_to_string(&path)?;
-    let clusters: Vec<ClusterInfo> = serde_json::from_str(&data)?;
-    Ok(Some(clusters))
+    let Ok(metadata) = serde_json::from_str::<Metadata>(&data) else {
+        // Unparseable or old format -- discard.
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    };
+    if metadata.version != METADATA_VERSION {
+        // Schema version mismatch -- discard.
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+    Ok(Some(metadata.clusters))
 }
 
 /// Generate a kubeconfig file name from doctl context and cluster name.
