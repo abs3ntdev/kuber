@@ -1,37 +1,49 @@
 use std::collections::HashSet;
-use std::io::Write;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use colored::Colorize;
-use tokio::process::Command;
-use tokio::sync::mpsc;
+use skim::prelude::*;
 
 use crate::cache;
 use crate::doctl;
 
+/// Fetch cluster lists from all doctl contexts in parallel using scoped threads.
+/// Returns the combined list of clusters.
+fn fetch_all_clusters(contexts: &[doctl::AuthContext]) -> Vec<doctl::ClusterInfo> {
+    let results: Mutex<Vec<doctl::ClusterInfo>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|s| {
+        for ctx in contexts {
+            let results = &results;
+            s.spawn(move || match doctl::list_clusters(&ctx.name) {
+                Ok(clusters) => {
+                    results.lock().unwrap().extend(clusters);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("Warning: failed to list clusters for '{}': {e}", ctx.name)
+                            .yellow()
+                    );
+                }
+            });
+        }
+    });
+
+    results.into_inner().unwrap()
+}
+
 /// Discover all clusters across all doctl auth contexts and save metadata.
-async fn full_sync() -> anyhow::Result<Vec<doctl::ClusterInfo>> {
+fn full_sync() -> anyhow::Result<Vec<doctl::ClusterInfo>> {
     eprintln!(
         "{}",
         "Discovering clusters across all doctl contexts...".blue()
     );
 
-    let contexts = doctl::list_auth_contexts().await?;
-    let mut all_clusters = Vec::new();
-
-    for ctx in &contexts {
-        match doctl::list_clusters(&ctx.name).await {
-            Ok(clusters) => all_clusters.extend(clusters),
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    format!("Warning: failed to list clusters for '{}': {e}", ctx.name).yellow()
-                );
-            }
-        }
-    }
+    let contexts = doctl::list_auth_contexts()?;
+    let all_clusters = fetch_all_clusters(&contexts);
 
     if all_clusters.is_empty() {
         anyhow::bail!("No kubernetes clusters found across any doctl context.");
@@ -46,13 +58,19 @@ async fn full_sync() -> anyhow::Result<Vec<doctl::ClusterInfo>> {
     Ok(all_clusters)
 }
 
-/// Download a kubeconfig for a cluster if not already cached.
-async fn ensure_hydrated(cluster: &doctl::ClusterInfo) -> anyhow::Result<()> {
+/// Download a kubeconfig for a cluster if not cached or older than 24 hours.
+fn ensure_hydrated(cluster: &doctl::ClusterInfo) -> anyhow::Result<()> {
     let filename = cache::config_filename(&cluster.doctl_context, &cluster.name);
     let path = cache::configs_dir().join(&filename);
 
     if path.exists() {
-        return Ok(());
+        let fresh = path.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
+            t.elapsed()
+                .is_ok_and(|age| age < std::time::Duration::from_secs(24 * 60 * 60))
+        });
+        if fresh {
+            return Ok(());
+        }
     }
 
     eprintln!(
@@ -60,128 +78,163 @@ async fn ensure_hydrated(cluster: &doctl::ClusterInfo) -> anyhow::Result<()> {
         format!("Fetching kubeconfig for {}...", cluster.kube_context_name()).yellow()
     );
 
-    let content = doctl::download_kubeconfig(&cluster.doctl_context, &cluster.id).await?;
+    let content = doctl::download_kubeconfig(&cluster.doctl_context, &cluster.id)?;
     cache::write_config(cluster, &content)?;
 
     Ok(())
 }
 
-/// Launch fzf fed by cached metadata instantly, with a background doctl sync that
-/// streams newly discovered context names into fzf live. When the user makes a
-/// selection (or cancels), the background sync is aborted immediately.
-///
-/// Returns `(selected context name, best-available cluster list)` or `None` if cancelled.
-async fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doctl::ClusterInfo>)>>
-{
-    let cached_clusters = cache::load_metadata()?.unwrap_or_default();
+/// Interactive context picker using skim. Cached names appear instantly.
+/// Background thread syncs from doctl and pushes new names into skim live.
+#[allow(clippy::too_many_lines)]
+fn pick_context_with_live_sync() -> anyhow::Result<Option<(String, Vec<doctl::ClusterInfo>)>> {
+    // If no metadata exists, do a full sync first so the user sees all clusters.
+    let cached_clusters = match cache::load_metadata()? {
+        Some(clusters) if !clusters.is_empty() => clusters,
+        _ => full_sync()?,
+    };
+
     let cached_names: HashSet<String> = cached_clusters
         .iter()
         .map(doctl::ClusterInfo::kube_context_name)
         .collect();
 
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    // Skim reads batches of items from this channel and renders them as they arrive.
+    let (tx, rx): (SkimItemSender, SkimItemReceiver) = bounded(50);
 
-    // Send cached names immediately so fzf has content before the sync starts.
-    for name in &cached_names {
-        let _ = tx.send(name.clone());
-    }
+    // Send cached names immediately.
+    let items: Vec<Arc<dyn SkimItem>> = cached_names
+        .iter()
+        .map(|name| Arc::new(name.clone()) as Arc<dyn SkimItem>)
+        .collect();
+    let _ = tx.send(items);
 
-    // Shared accumulator: background sync appends here as it discovers clusters.
-    let discovered: Arc<Mutex<Vec<doctl::ClusterInfo>>> =
+    // Shared cluster list for the preview callback and background sync.
+    let clusters_shared: Arc<Mutex<Vec<doctl::ClusterInfo>>> =
         Arc::new(Mutex::new(cached_clusters.clone()));
 
-    // Background sync: iterates doctl contexts, streams new names into fzf,
-    // saves metadata incrementally.
-    let discovered_bg = Arc::clone(&discovered);
-    let sync_handle = tokio::spawn(async move {
-        let Ok(contexts) = doctl::list_auth_contexts().await else {
+    // Background thread: discover new clusters in parallel, send them into skim,
+    // save metadata only if something changed.
+    let clusters_bg = Arc::clone(&clusters_shared);
+    let tx_bg = tx.clone();
+    std::thread::spawn(move || {
+        let Ok(contexts) = doctl::list_auth_contexts() else {
             return;
         };
 
-        for ctx in &contexts {
-            let Ok(clusters) = doctl::list_clusters(&ctx.name).await else {
-                continue;
-            };
+        // Fetch all contexts in parallel.
+        let fresh_clusters = fetch_all_clusters(&contexts);
+        let mut changed = false;
+        let mut new_items: Vec<Arc<dyn SkimItem>> = Vec::new();
 
-            let mut new_names = Vec::new();
-            {
-                let mut acc = discovered_bg.lock().unwrap();
-                for cluster in &clusters {
-                    let name = cluster.kube_context_name();
-                    if !acc.iter().any(|c| c.kube_context_name() == name) {
-                        acc.push(cluster.clone());
-                        if !cached_names.contains(&name) {
-                            new_names.push(name);
-                        }
-                    }
-                }
-                let _ = cache::save_metadata(&acc);
-            }
-
-            for name in new_names {
-                if tx.send(name).is_err() {
-                    return; // fzf closed, user already picked
+        {
+            let mut all = clusters_bg.lock().unwrap();
+            for cluster in fresh_clusters {
+                let name = cluster.kube_context_name();
+                if !cached_names.contains(&name)
+                    && !all.iter().any(|c| c.kube_context_name() == name)
+                {
+                    new_items.push(Arc::new(name));
+                    all.push(cluster);
+                    changed = true;
                 }
             }
+
+            if changed {
+                let _ = cache::save_metadata(&all);
+            }
+        }
+
+        if !new_items.is_empty() {
+            let _ = tx_bg.send(new_items);
         }
     });
 
-    let mut fzf = std::process::Command::new("fzf")
-        .args(["--height=~40%", "--reverse", "--prompt=context> "])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("Failed to launch fzf. Is it installed?")?;
+    // Drop our sender so skim knows we're done once the background thread finishes.
+    drop(tx);
 
-    let fzf_stdin = fzf.stdin.take().context("Failed to open fzf stdin")?;
+    // Preview callback: look up cluster info by context name and format it.
+    let clusters_preview = Arc::clone(&clusters_shared);
+    let preview_fn = move |items: Vec<Arc<dyn SkimItem>>| -> Vec<String> {
+        let Some(item) = items.first() else {
+            return vec![];
+        };
+        let ctx_name = item.output().to_string();
+        let clusters = clusters_preview.lock().unwrap();
+        let Some(cluster) = clusters.iter().find(|c| c.kube_context_name() == ctx_name) else {
+            return vec![format!("No metadata for {ctx_name}")];
+        };
 
-    // Feed names into fzf as they arrive from the channel.
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        let mut stdin = fzf_stdin;
-        let mut rx = rx;
-        while let Some(name) = rx.blocking_recv() {
-            if writeln!(stdin, "{name}").is_err() {
-                break;
+        let mut lines = vec![
+            format!("  Cluster:  {}", cluster.name),
+            format!("  Region:   {}", cluster.region),
+            format!("  Account:  {}", cluster.doctl_context),
+        ];
+
+        if !cluster.version.is_empty() {
+            lines.push(format!("  Version:  {}", cluster.version));
+        }
+        if !cluster.status.is_empty() {
+            lines.push(format!("  Status:   {}", cluster.status));
+        }
+        if cluster.ha {
+            lines.push("  HA:       yes".to_string());
+        }
+        if !cluster.node_pools.is_empty() {
+            lines.push(String::new());
+            lines.push("  Node Pools:".to_string());
+            for pool in &cluster.node_pools {
+                let scaling = match (pool.min_nodes, pool.max_nodes) {
+                    (Some(min), Some(max)) => format!("{min}-{max} nodes (autoscale)"),
+                    _ if pool.count > 0 => format!("{} nodes", pool.count),
+                    _ => "unknown".to_string(),
+                };
+                lines.push(format!("    {} ({}, {})", pool.name, pool.size, scaling));
             }
         }
-    });
 
-    let output = tokio::task::spawn_blocking(move || fzf.wait_with_output())
-        .await?
-        .context("Failed to wait for fzf")?;
+        lines
+    };
 
-    // Kill the background sync immediately so we don't waste time or network.
-    sync_handle.abort();
-    let _ = writer_handle.await;
+    let options = SkimOptionsBuilder::default()
+        .reverse(true)
+        .cycle(true)
+        .prompt("context> ")
+        .info(skim::tui::statusline::InfoDisplay::Hidden)
+        .color("16")
+        .preview_fn(preview_fn)
+        .build()
+        .expect("Failed to build skim options");
 
-    if !output.status.success() {
+    let output = Skim::run_with(options, Some(rx)).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if output.is_abort {
         return Ok(None);
     }
 
-    let selection = String::from_utf8(output.stdout)?.trim().to_string();
-    if selection.is_empty() {
+    let Some(selected) = output.selected_items.first() else {
         return Ok(None);
-    }
+    };
 
-    let clusters = discovered.lock().unwrap().clone();
+    let selection = selected.output().to_string();
+
+    // Use the shared cluster list which includes any newly discovered clusters.
+    let clusters = clusters_shared.lock().unwrap().clone();
 
     Ok(Some((selection, clusters)))
 }
 
-/// Show cached contexts instantly via fzf with live background refresh,
-/// hydrate only the selected context, launch kubie.
-pub async fn ctx(context: Option<String>) -> anyhow::Result<()> {
+/// Main entry point. Fully synchronous -- no async runtime needed.
+pub fn ctx(context: Option<String>) -> anyhow::Result<()> {
     let (ctx_name, clusters) = match context {
         Some(name) => {
-            // Direct context name -- try cache first, full sync if not found.
             let mut clusters = cache::load_metadata()?.unwrap_or_default();
             if cache::find_config_for_context(&name, &clusters).is_none() {
-                clusters = full_sync().await?;
+                clusters = full_sync()?;
             }
             (name, clusters)
         }
-        None => match pick_context_with_live_sync().await? {
+        None => match pick_context_with_live_sync()? {
             Some(result) => result,
             None => return Ok(()),
         },
@@ -190,7 +243,7 @@ pub async fn ctx(context: Option<String>) -> anyhow::Result<()> {
     let (_, cluster) = cache::find_config_for_context(&ctx_name, &clusters)
         .context(format!("Unknown context: {ctx_name}"))?;
 
-    ensure_hydrated(&cluster).await?;
+    ensure_hydrated(&cluster)?;
 
     let config_file = cache::configs_dir().join(cache::config_filename(
         &cluster.doctl_context,
@@ -205,11 +258,7 @@ pub async fn ctx(context: Option<String>) -> anyhow::Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .await
         .context("Failed to launch kubie")?;
-
-    // Clean up the ephemeral kubeconfig now that the kubie shell has exited.
-    let _ = std::fs::remove_file(&config_file);
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));

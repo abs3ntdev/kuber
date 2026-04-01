@@ -5,53 +5,82 @@ use std::sync::OnceLock;
 
 use crate::doctl::ClusterInfo;
 
-static CACHE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+/// Persistent storage for metadata (survives reboots).
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Initialize the cache root directory. Must be called once at startup.
-/// Uses `KUBER_CACHE_DIR` env var if set, otherwise defaults to `/dev/shm/kuber-<uid>/`.
+/// Ephemeral storage for kubeconfig files.
+static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Initialize cache paths. Must be called once at startup.
+///
+/// - Metadata: `$XDG_CACHE_HOME/kuber/` (default `~/.cache/kuber/`)
+/// - Configs:  `/tmp/kuber-<uid>/configs/`
 pub fn init() {
-    CACHE_ROOT.get_or_init(|| {
-        if let Ok(dir) = std::env::var("KUBER_CACHE_DIR") {
+    DATA_DIR.get_or_init(|| {
+        let base = if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
             PathBuf::from(dir)
         } else {
-            // SAFETY: getuid is always safe to call.
-            let uid = unsafe { libc::getuid() };
-            PathBuf::from(format!("/dev/shm/kuber-{uid}"))
-        }
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".cache")
+        };
+        base.join("kuber")
+    });
+
+    TEMP_DIR.get_or_init(|| {
+        // SAFETY: getuid is always safe to call.
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/kuber-{uid}"))
     });
 }
 
-fn cache_root() -> &'static Path {
-    CACHE_ROOT
+fn data_dir() -> &'static Path {
+    DATA_DIR
         .get()
         .expect("cache::init() must be called before using cache")
 }
 
-/// Returns the configs directory under the cache root.
+fn temp_dir() -> &'static Path {
+    TEMP_DIR
+        .get()
+        .expect("cache::init() must be called before using cache")
+}
+
+/// Returns the configs directory (ephemeral, in /tmp).
 pub fn configs_dir() -> PathBuf {
-    cache_root().join("configs")
+    temp_dir().join("configs")
 }
 
-/// Returns the metadata file path under the cache root.
+/// Returns the metadata file path (persistent, in XDG cache).
 fn metadata_path() -> PathBuf {
-    cache_root().join("metadata.json")
+    data_dir().join("metadata.json")
 }
 
-/// Ensure the cache directories exist with restrictive permissions.
-fn ensure_cache_dirs() -> anyhow::Result<()> {
+/// Ensure the ephemeral configs directory exists with restrictive permissions.
+fn ensure_configs_dir() -> anyhow::Result<()> {
     let dir = configs_dir();
     if !dir.exists() {
         fs::create_dir_all(&dir)?;
-        fs::set_permissions(cache_root(), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(temp_dir(), fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
 
-/// Save metadata (cluster list) to the cache.
+/// Ensure the persistent data directory exists.
+fn ensure_data_dir() -> anyhow::Result<()> {
+    let dir = data_dir();
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+/// Save metadata (cluster list) to persistent storage.
 pub fn save_metadata(clusters: &[ClusterInfo]) -> anyhow::Result<()> {
-    ensure_cache_dirs()?;
+    ensure_data_dir()?;
+    let path = metadata_path();
     let json = serde_json::to_string_pretty(clusters)?;
-    fs::write(metadata_path(), json)?;
+    fs::write(&path, json)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -81,12 +110,13 @@ pub fn config_filename(doctl_context: &str, cluster_name: &str) -> String {
     format!("{safe_context}_{safe_cluster}.yaml")
 }
 
-/// Write a kubeconfig fetched from doctl to the cache.
+/// Write a kubeconfig fetched from doctl to the ephemeral cache.
 pub fn write_config(cluster: &ClusterInfo, content: &str) -> anyhow::Result<PathBuf> {
-    ensure_cache_dirs()?;
+    ensure_configs_dir()?;
     let filename = config_filename(&cluster.doctl_context, &cluster.name);
     let path = configs_dir().join(&filename);
     fs::write(&path, content)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(path)
 }
 
