@@ -270,9 +270,8 @@ pub fn ctx(context: Option<String>, no_sync: bool) -> anyhow::Result<()> {
         &cluster.name,
     ));
 
-    // Spawn a detached background process that deletes the config file after
-    // 5 seconds. This survives the parent terminal being killed since it's a
-    // separate forked process, not a thread.
+    // Spawn a detached background process that deletes our config file after
+    // 5 seconds. This survives the parent terminal being killed.
     spawn_delayed_delete(&config_file);
 
     let status = Command::new("kubie")
@@ -325,8 +324,7 @@ fn spawn_delayed_delete(path: &std::path::Path) {
         return;
     }
 
-    // Use sleep as the command, then exec rm -- avoids shell interpolation entirely.
-    // The path is passed as a direct argument, never embedded in a string.
+    // The path is passed as a direct argument, never embedded in a shell string.
     let canonical_str = canonical.to_string_lossy().to_string();
     let _ = Command::new("sh")
         .args(["-c", "sleep 5; rm -f -- \"$1\"", "--", &canonical_str])
