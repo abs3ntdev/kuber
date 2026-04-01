@@ -17,6 +17,23 @@ Ephemeral kubeconfig manager for DigitalOcean Kubernetes clusters. Wraps [kubie]
 
 ## Install
 
+### Pre-built binary
+
+Download the latest release:
+
+```sh
+curl -sL https://github.com/abs3ntdev/kuber/releases/latest/download/kuber-linux-amd64.tar.gz | tar xz
+install -m 755 kuber ~/.local/bin/kuber
+```
+
+### From crates.io
+
+```sh
+cargo install kuber-ctx
+```
+
+### From source
+
 ```sh
 make install
 ```

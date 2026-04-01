@@ -1,9 +1,16 @@
 [package]
-name = "kuber"
+name = "kuber-ctx"
 version = "0.1.0"
 edition = "2024"
 description = "Ephemeral kubeconfig manager wrapping kubie with DigitalOcean doctl"
 license = "MIT"
+repository = "https://github.com/abs3ntdev/kuber"
+keywords = ["kubernetes", "kubeconfig", "digitalocean", "doctl", "kubie"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "kuber"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
