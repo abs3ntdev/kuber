@@ -270,6 +270,11 @@ pub fn ctx(context: Option<String>, no_sync: bool) -> anyhow::Result<()> {
         &cluster.name,
     ));
 
+    // Spawn a detached background process that deletes the config file after
+    // 5 seconds. This survives the parent terminal being killed since it's a
+    // separate forked process, not a thread.
+    spawn_delayed_delete(&config_file);
+
     let status = Command::new("kubie")
         .args(["ctx", "-f"])
         .arg(&config_file)
@@ -285,4 +290,48 @@ pub fn ctx(context: Option<String>, no_sync: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Spawn a fully detached background process that deletes a file after 5 seconds.
+/// The child is detached from the terminal session so it survives the parent
+/// being killed.
+///
+/// Safety checks:
+/// - Path must be inside the kuber configs directory
+/// - Path must have a `.yaml` extension
+/// - Path must be a regular file (not a symlink, directory, etc.)
+/// - Path is passed as an argument to `rm`, not interpolated into a shell string
+fn spawn_delayed_delete(path: &std::path::Path) {
+    let configs_dir = cache::configs_dir();
+
+    // Verify the path is inside our configs directory.
+    let Ok(canonical) = path.canonicalize() else {
+        return;
+    };
+    let Ok(canonical_configs) = configs_dir.canonicalize() else {
+        return;
+    };
+    if !canonical.starts_with(&canonical_configs) {
+        return;
+    }
+
+    // Must be a .yaml file.
+    if canonical.extension().and_then(|e| e.to_str()) != Some("yaml") {
+        return;
+    }
+
+    // Must be a regular file, not a symlink or directory.
+    if !canonical.is_file() || canonical.is_symlink() {
+        return;
+    }
+
+    // Use sleep as the command, then exec rm -- avoids shell interpolation entirely.
+    // The path is passed as a direct argument, never embedded in a string.
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let _ = Command::new("sh")
+        .args(["-c", "sleep 5; rm -f -- \"$1\"", "--", &canonical_str])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
